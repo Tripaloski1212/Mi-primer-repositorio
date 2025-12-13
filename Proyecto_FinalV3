@@ -1,0 +1,405 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ==============================================================================
+# 1. MÓDULO DE CONFIGURACIÓN Y DATOS (RF9) e INTERACCIÓN
+# ==============================================================================
+
+# **VALORES POR DEFECTO** (Base para RF9)
+DEFAULT_CONFIG = {
+    # Parámetros Base
+    'GOMPERTZ_ESTRUCTURAL': {'A': 200.0, 'b': 4.0, 'k': 0.015},
+    'GOMPERTZ_FOLIAR': {'A': 7.0, 'b': 5.0, 'k': 0.02},
+    'T_BASE': 8.0,
+    
+    # Parámetros de Estrés Térmico
+    'T_OPT_MIN': 15.0,
+    'T_OPT_MAX': 28.0,
+    
+    # Parámetros de Suelo y Pérdidas de Agua
+    'SUELO_CC': 150.0,
+    'SUELO_PMP': 50.0,
+    'SUELO_INICIAL': 120.0,
+    'ESCORRENTIA_FRACCION': 0.15,
+    
+    # Coeficientes de Cultivo (Kc) por Estadio BBCH (RF2)
+    'KC_BBCH': {
+        '00': 0.3, '10': 0.4, '30': 0.8, '60': 1.15, '70': 0.9, '90': 0.5
+    },
+    'DIAS_SIMULACION': 90
+}
+
+RANGOS_BBCH = {
+    (0, 500): "10 - Emergencia",
+    (501, 1200): "30 - Desarrollo",
+    (1201, 2000): "60 - Floración",
+    (2001, 3000): "70 - Maduración"
+}
+
+
+def validar_input_rango(prompt, default_value, min_val, max_val, unit=''):
+    """Helper para validar si un input está dentro de un rango plausible.
+       Retroalimentación específica (insuficiente/exagerado) sin formato especial.
+    """
+    while True:
+        user_input = input(f"{prompt} (default: {default_value}{unit}, rango: {min_val}-{max_val}{unit}): ")
+        if not user_input:
+            return default_value # Usa el valor por defecto si no hay input
+        
+        try:
+            value = float(user_input)
+            if min_val <= value <= max_val:
+                return value
+            else:
+                # <-- CAMBIO DE LÓGICA AQUÍ: Mensaje normalizado -->
+                if value < min_val:
+                    print(f"❌ ERROR: El valor {value}{unit} es demasiado bajo/insuficiente. El mínimo plausible es {min_val}{unit}.")
+                elif value > max_val:
+                    print(f"❌ ERROR: El valor {value}{unit} es exagerado/demasiado alto. El máximo plausible es {max_val}{unit}.")
+                # <-- FIN DEL CAMBIO -->
+        except ValueError:
+            print("❌ ERROR: Ingrese un valor numérico válido.")
+
+def solicitar_parametros_iniciales():
+    """RF9 - Permite al usuario configurar los parámetros clave del simulador con validación."""
+    config = DEFAULT_CONFIG.copy()
+    print("\n--- 📝 Configuración Inicial del Simulador (RF9 con Validación Mejorada) ---")
+    
+    # 1. Parámetros Agronómicos Base
+    print("\n* Parámetros Base:")
+    config['T_BASE'] = validar_input_rango(
+        "Ingrese Temperatura Base para GDD", config['T_BASE'], 0.0, 15.0, '°C')
+    
+    # 2. Parámetros de Estrés Térmico (RF7)
+    print("\n* Parámetros de Estrés por Temperatura (Control de FT):")
+    
+    # T° Óptima Mínima
+    config['T_OPT_MIN'] = validar_input_rango(
+        "  T° Óptima Mínima", config['T_OPT_MIN'], 5.0, 25.0, '°C')
+
+    # T° Óptima Máxima (Debe ser mayor que la mínima)
+    while True:
+        t_max_input = validar_input_rango(
+            "  T° Óptima Máxima", config['T_OPT_MAX'], 20.0, 40.0, '°C')
+        if t_max_input > config['T_OPT_MIN']:
+            config['T_OPT_MAX'] = t_max_input
+            break
+        else:
+            print(f"❌ ERROR: T° Máxima ({t_max_input}°C) debe ser mayor que T° Mínima ({config['T_OPT_MIN']}°C).")
+            
+    # 3. Parámetros de Manejo de Agua (RF6/RF9)
+    print("\n* Parámetros de Suelo y Manejo de Agua:")
+    config['SUELO_CC'] = validar_input_rango(
+        "  Capacidad de Campo CC", config['SUELO_CC'], 50.0, 300.0, ' mm')
+        
+    config['SUELO_PMP'] = validar_input_rango(
+        "  Punto de Marchitez Permanente PMP", config['SUELO_PMP'], 10.0, config['SUELO_CC'] * 0.9, ' mm')
+
+    config['ESCORRENTIA_FRACCION'] = validar_input_rango(
+        "  Fracción de Escorrentía", config['ESCORRENTIA_FRACCION'], 0.0, 1.0, '')
+    
+    print("\n--- ✅ Configuración Guardada ---")
+    return config
+
+def generar_datos_met(dias_simulacion):
+    """RF9. Simula datos climáticos diarios, incluyendo Lluvia, Riego y ET base."""
+    tmax = np.random.uniform(20, 32, dias_simulacion)
+    tmin = np.random.uniform(10, 18, dias_simulacion)
+    radiacion = np.random.uniform(15, 25, dias_simulacion)
+    lluvia = np.array([np.random.choice([0, 0, 0, 0, 5, 10, 20]) for _ in range(dias_simulacion)])
+    
+    riego = np.zeros(dias_simulacion)
+    riego[[30, 60, 80]] = 25 
+    
+    ET0_diaria = np.random.uniform(4.0, 6.0, dias_simulacion) 
+    
+    return pd.DataFrame({
+        'Tmax': tmax, 'Tmin': tmin, 'Radiacion': radiacion, 
+        'Lluvia': lluvia, 'Riego': riego, 'ET0': ET0_diaria
+    })
+
+# ==============================================================================
+# 2. MÓDULO DE MODELOS MATEMÁTICOS Y BIOLÓGICOS
+# ==============================================================================
+
+def calcular_GDD_diario(Tmax, Tmin, Tbase):
+    """RF1. Calcula los Grados-Día diarios."""
+    T_promedio = (Tmax + Tmin) / 2
+    return max(0, T_promedio - Tbase)
+
+def gompertz(GDD_acumulado, A, b, k):
+    """RF3 y RF4. Modelo de crecimiento Gompertz."""
+    if GDD_acumulado < 1: return 0.0
+    return A * np.exp(-b * np.exp(-k * GDD_acumulado))
+
+def asignar_BBCH(GDD_acumulado):
+    """RF2. Asigna un estadio fenológico BBCH basado en GDD acumulado."""
+    for (min_gdd, max_gdd), estadio in RANGOS_BBCH.items():
+        if min_gdd <= GDD_acumulado <= max_gdd:
+            return estadio
+    if GDD_acumulado > max(max_gdd for _, max_gdd in RANGOS_BBCH.keys()):
+        return "90 - Cosecha"
+    return "00 - Germinación"
+
+def calcular_factor_estres_agua(humedad, CC, PMP):
+    """Factor de Estrés Hídrico (Fw) - Parte de RF7."""
+    agua_disponible = humedad - PMP
+    capacidad_maxima = CC - PMP
+    if capacidad_maxima <= 0: return 1.0
+    if agua_disponible <= 0: return 0.0 
+    factor = agua_disponible / capacidad_maxima
+    return min(1.0, factor) 
+
+def calcular_factor_estres_temperatura(Tmax, Tmin, T_opt_min, T_opt_max):
+    """Factor de Estrés Térmico (Ft) - Parte de RF7."""
+    T_promedio = (Tmax + Tmin) / 2
+    if T_opt_min <= T_promedio <= T_opt_max: return 1.0
+    
+    # Penalización simplificada
+    if T_promedio < T_opt_min: return max(0.0, (T_promedio - 0) / (T_opt_min - 0))
+    if T_promedio > T_opt_max: 
+        T_letal = T_opt_max + 5
+        return max(0.0, 1.0 - (T_promedio - T_opt_max) / (T_letal - T_opt_max))
+    return 1.0 
+
+def calcular_ET_Kc(ET0, Kc, Fw):
+    """RF6. Evapotranspiración Real (ETR) usando ET0, Kc y Factor de Estrés."""
+    ET_potencial = ET0 * Kc 
+    ET_real = ET_potencial * Fw 
+    return max(0.0, ET_real)
+
+
+# ==============================================================================
+# 3. CLASE DE ESTADO DE LA PLANTA (RF7)
+# ==============================================================================
+
+class Planta:
+    """Clase que mantiene el estado actual de la planta y el suelo (RF7)."""
+    def __init__(self, config):
+        self.Tbase = config['T_BASE']
+        # K_EXTINCION no está en config, usando valor por defecto para evitar error
+        self.k_extincion = 0.6 
+        self.kc_bbch = config['KC_BBCH']
+        self.param_estructural = config['GOMPERTZ_ESTRUCTURAL']
+        self.param_foliar = config['GOMPERTZ_FOLIAR']
+        self.T_opt_min = config['T_OPT_MIN']
+        self.T_opt_max = config['T_OPT_MAX']
+        self.escorrentia_fraccion = config['ESCORRENTIA_FRACCION']
+
+        # Balance Hídrico
+        self.CC = config['SUELO_CC']
+        self.PMP = config['SUELO_PMP']
+        self.humedad_suelo = config['SUELO_INICIAL']
+        
+        # Variables de estado y seguimiento
+        self.dia = 0
+        self.GDD_acumulado = 0.0
+        self.altura = 0.0
+        self.LAI = 0.0
+        self.BBCH = '00'
+        
+        self.factor_estres_total = 1.0
+        self.ET_diaria_real = 0.0 
+        self.perdida_drenaje = 0.0
+        self.perdida_escorrentia = 0.0
+
+    def actualizar_balance_agua(self, lluvia_diaria, riego_diario, ET_real):
+        """RF6 MEJORADO. Actualiza Balance Hídrico con Lluvia, Riego, Escorrentía y Drenaje."""
+        
+        # 1. Entrada de Agua y Pérdida por Escorrentía (RF9)
+        agua_total_entrada = lluvia_diaria + riego_diario
+        agua_neta_infiltrada = agua_total_entrada * (1 - self.escorrentia_fraccion)
+        self.perdida_escorrentia = agua_total_entrada * self.escorrentia_fraccion
+        
+        # 2. Balance hídrico provisional
+        humedad_provisional = self.humedad_suelo + agua_neta_infiltrada - ET_real
+        
+        # 3. Drenaje Profundo (Pérdida por debajo de Capacidad de Campo)
+        self.perdida_drenaje = 0.0
+        if humedad_provisional > self.CC:
+            self.perdida_drenaje = humedad_provisional - self.CC
+            self.humedad_suelo = self.CC # El exceso de agua se drena inmediatamente
+        else:
+            self.humedad_suelo = humedad_provisional
+
+        # 4. Asegurar PMP
+        self.humedad_suelo = max(self.PMP, self.humedad_suelo) 
+        # Si la humedad cae a PMP, el factor de estrés Fw es 0, penalizando la ET y crecimiento.
+
+    def actualizar_crecimiento_diario(self, GDD_diario, dia_data):
+        """RF7. Ejecuta la secuencia diaria."""
+        self.dia += 1
+        self.GDD_acumulado += GDD_diario 
+        
+        # 1. Cálculo de Estrés (Fw y Ft)
+        Tmax, Tmin = dia_data['Tmax'], dia_data['Tmin']
+        ET0 = dia_data['ET0']
+        
+        factor_estres_agua = calcular_factor_estres_agua(self.humedad_suelo, self.CC, self.PMP)
+        factor_estres_temperatura = calcular_factor_estres_temperatura(
+            Tmax, Tmin, self.T_opt_min, self.T_opt_max)
+        
+        # Factor de Estrés Total (RF7: el más limitante)
+        self.factor_estres_total = min(factor_estres_agua, factor_estres_temperatura)
+
+        # 2. Asignación BBCH (RF2) y Kc (RF6)
+        self.BBCH = asignar_BBCH(self.GDD_acumulado)
+        Kc = self.kc_bbch.get(self.BBCH.split(' ')[0], 0.5)
+
+        # 3. Cálculo de ET (RF6) y Actualización del Balance Hídrico
+        self.ET_diaria_real = calcular_ET_Kc(ET0, Kc, factor_estres_agua)
+        self.actualizar_balance_agua(dia_data['Lluvia'], dia_data['Riego'], self.ET_diaria_real)
+
+        # 4. Crecimiento (RF3 y RF4) - Modulado por F_Total
+        
+        # Altura (RF3)
+        p_est = self.param_estructural
+        altura_potencial = gompertz(self.GDD_acumulado, p_est['A'], p_est['b'], p_est['k'])
+        delta_altura_potencial = altura_potencial - self.altura
+        self.altura = self.altura + delta_altura_potencial * self.factor_estres_total
+        self.altura = max(0.0, self.altura)
+
+        # LAI (RF4)
+        p_fol = self.param_foliar
+        lai_potencial = gompertz(self.GDD_acumulado, p_fol['A'], p_fol['b'], p_fol['k'])
+        delta_lai_potencial = lai_potencial - self.LAI
+        self.LAI = self.LAI + delta_lai_potencial * self.factor_estres_total
+        self.LAI = max(0.0, self.LAI)
+
+        # 5. Intercepción de Luz (RF5)
+        self.luz_interceptada = 1 - np.exp(-self.k_extincion * self.LAI)
+
+        return {
+            'Día': self.dia,
+            'GDD_Acumulado': self.GDD_acumulado,
+            'Altura (cm)': round(self.altura, 2),
+            'LAI (m2/m2)': round(self.LAI, 2),
+            'F_Total': round(self.factor_estres_total, 2),
+            'BBCH': self.BBCH
+        }
+
+# ==============================================================================
+# 4. FUNCIÓN PRINCIPAL DE SIMULACIÓN INTERACTIVA (RF7, RF8, RF10)
+# ==============================================================================
+
+def ejecutar_simulacion():
+    """RF7. Ejecuta el bucle de simulación de forma interactiva."""
+    print("--- 🌿 Iniciando Simulador de Cultivo V8 (Mensajes de Validación Limpios) ---")
+    
+    # INTERACCIÓN 1: Configuración Inicial (RF9)
+    config = solicitar_parametros_iniciales() 
+    
+    datos_met = generar_datos_met(config['DIAS_SIMULACION']) 
+    mi_planta = Planta(config)
+
+    resultados = [] 
+    comando = 'S'
+
+    for index, dia_data in datos_met.iterrows():
+        GDD_diario = calcular_GDD_diario(dia_data['Tmax'], dia_data['Tmin'], mi_planta.Tbase)
+        registro_diario = mi_planta.actualizar_crecimiento_diario(GDD_diario, dia_data)
+        
+        registro_completo = {**registro_diario,
+                             'Lluvia (mm)': round(dia_data['Lluvia'], 2),
+                             'Riego (mm)': round(dia_data['Riego'], 2),
+                             'Perdida_Escorrentia (mm)': round(mi_planta.perdida_escorrentia, 2),
+                             'Perdida_Drenaje (mm)': round(mi_planta.perdida_drenaje, 2),
+                             'Humedad_Suelo (mm)': round(mi_planta.humedad_suelo, 2),
+                             'ET_Real (mm)': round(mi_planta.ET_diaria_real, 2)}
+        resultados.append(registro_completo)
+
+        # INTERACCIÓN 2: Control Paso a Paso (RF7)
+        if comando != 'A':
+            print(f"\n--- DÍA {mi_planta.dia} | BBCH: {mi_planta.BBCH} (GDD: {round(mi_planta.GDD_acumulado)}) ---")
+            print(f"  > Altura: {registro_completo['Altura (cm)']} cm | LAI: {registro_completo['LAI (m2/m2)']}")
+            print(f"  > Entrada (Lluvia+Riego): {registro_completo['Lluvia (mm)']+registro_completo['Riego (mm)']} mm | Salida (ET+Drenaje+Esc.): {registro_completo['ET_Real (mm)']+registro_completo['Perdida_Drenaje (mm)']+registro_completo['Perdida_Escorrentia (mm)']} mm")
+            print(f"  > F_TOTAL: {registro_completo['F_Total']} | Humedad Final: {registro_completo['Humedad_Suelo (mm)']} mm")
+            
+            comando = input("Presione 'S' (Siguiente día), 'A' (Automático), 'F' (Finalizar): ").upper()
+            
+            if comando == 'F': break
+            elif comando == 'A': print("Iniciando simulación automática...")
+            elif comando != 'S': comando = 'S'
+    
+    # Simulación automática si el usuario eligió 'A'
+    if comando == 'A':
+        for index in range(mi_planta.dia, config['DIAS_SIMULACION']):
+            dia_data = datos_met.iloc[index]
+            GDD_diario = calcular_GDD_diario(dia_data['Tmax'], dia_data['Tmin'], mi_planta.Tbase)
+            registro_diario = mi_planta.actualizar_crecimiento_diario(GDD_diario, dia_data)
+            
+            registro_completo = {**registro_diario,
+                             'Lluvia (mm)': round(dia_data['Lluvia'], 2),
+                             'Riego (mm)': round(dia_data['Riego'], 2),
+                             'Perdida_Escorrentia (mm)': round(mi_planta.perdida_escorrentia, 2),
+                             'Perdida_Drenaje (mm)': round(mi_planta.perdida_drenaje, 2),
+                             'Humedad_Suelo (mm)': round(mi_planta.humedad_suelo, 2),
+                             'ET_Real (mm)': round(mi_planta.ET_diaria_real, 2)}
+            resultados.append(registro_completo)
+
+
+    # 4. Procesar y Exportar Resultados (RF10)
+    df_resultados = pd.DataFrame(resultados)
+    nombre_archivo = 'simulacion_v8_validada_final.csv'
+    df_resultados.to_csv(nombre_archivo, index=False)
+    print(f"\nResultados exportados a: {nombre_archivo} (RF10)")
+    
+    # 5. Visualización (RF8)
+    visualizar_resultados(df_resultados)
+
+
+def visualizar_resultados(df):
+    """RF8. Muestra gráficos de las variables de crecimiento y estrés."""
+    plt.style.use('seaborn-v0_8-whitegrid')
+    # Usar los valores por defecto del config para la visualización
+    local_default_config = {
+        'SUELO_CC': 150.0,
+        'SUELO_PMP': 50.0,
+    }
+
+    fig, axs = plt.subplots(2, 1, figsize=(12, 10))
+    fig.suptitle('RF8: Visualización del Balance Hídrico y Crecimiento (V8)', fontsize=16)
+
+    # Gráfico 1: Balance Hídrico (RF6) - El corazón de la nueva fidelidad
+    axs[0].plot(df['Día'], df['Humedad_Suelo (mm)'], label='Humedad Suelo Final (mm)', color='blue', linewidth=2)
+    axs[0].axhline(y=local_default_config['SUELO_CC'], color='green', linestyle='--', alpha=0.6, label='Capacidad Campo (CC)')
+    axs[0].axhline(y=local_default_config['SUELO_PMP'], color='red', linestyle='--', alpha=0.6, label='Punto Marchitez (PMP)')
+    
+    # Entradas/Salidas
+    axs[0].fill_between(df['Día'], 0, df['Lluvia (mm)'], alpha=0.3, color='skyblue', label='Lluvia (mm)')
+    axs[0].bar(df['Día'], df['Riego (mm)'], label='Riego (mm)', color='darkcyan', alpha=0.6, width=1.0) 
+    
+    ax2 = axs[0].twinx()
+    ax2.plot(df['Día'], df['ET_Real (mm)'], label='ET Real (mm)', color='darkorange', linestyle='-')
+    ax2.plot(df['Día'], df['Perdida_Drenaje (mm)'], label='Pérdida Drenaje (mm)', color='purple', linestyle=':')
+    ax2.set_ylabel('Flujos de Agua (mm/día)')
+    ax2.tick_params(axis='y')
+    
+    axs[0].set_ylabel('Humedad Suelo (mm)')
+    axs[0].set_title('Balance Hídrico Detallado: Lluvia, Riego, Escorrentía y Drenaje (RF6)')
+    axs[0].legend(loc='upper left')
+    ax2.legend(loc='upper right')
+    
+
+    # Gráfico 2: Crecimiento y Estrés Dual (RF3, RF4, RF7)
+    axs[1].plot(df['Día'], df['Altura (cm)'], label='Altura (cm) - RF3', color='green')
+    axs[1].plot(df['Día'], df['LAI (m2/m2)'], label='LAI (m2/m2) - RF4', color='saddlebrown')
+    
+    ax3 = axs[1].twinx()
+    ax3.plot(df['Día'], df['F_Total'], label='Factor Estrés Total ($F_{Total}$)', color='red', linestyle='-')
+    ax3.set_ylabel('Factor Estrés (0.0-1.0)', color='red')
+    ax3.tick_params(axis='y', labelcolor='red')
+    
+    axs[1].set_xlabel('Día de Simulación')
+    axs[1].set_ylabel('Altura / LAI')
+    axs[1].set_title('Crecimiento Modulado por el Factor de Estrés Total (RF7)')
+    axs[1].legend(loc='upper left')
+    ax3.legend(loc='upper right')
+
+    plt.tight_layout()
+    plt.show()
+
+# Ejecución del programa
+if __name__ == "__main__":
+    ejecutar_simulacion()
